@@ -232,6 +232,7 @@ function handleRoomMessage(message){
   S.statusText='표준 체스 대국이 시작됐습니다.';render();toast('표준 체스 대국 시작');return;
  }
  if(message.type==='move'){applyRoomMove(message.move,message.side,false)}
+ if(message.type==='end'){finishRoomGame(message.outcome,message.reason||'서버가 대국을 종료했습니다.');return}
 }
 function selectRoomFormation(id){const f=OPENINGS.find(x=>x.id===id);if(!f||f.special||S.roomSelfReady)return;S.roomOwnFormation=id;S.formation=id;S.board=replayFormationBoard(id,S.playerColor)||standardOpeningBoard();S.selected=null;S.legal=[];S.statusText='상대에게는 진형 선택이 숨겨져 있습니다.';roomSend({type:'select',formation:id});render()}
 function readyRoom(){if(S.mode!=='roomPrep'||S.playerColor!=='w'||S.roomSelfReady)return;if(!S.roomPeerConnected){toast('참가자가 들어올 때까지 시작할 수 없습니다.');return}S.roomSelfReady=true;S.statusText='대국을 준비하고 있습니다.';roomSend({type:'begin'});render()}
@@ -553,3 +554,100 @@ render=function(){
 };
 render();
 
+// Free chess-legal setup moves; one level move is spent only for a custom
+// relocation/swap that would not be legal in an ordinary chess position.
+function legalPrepMovesFrom(unitId){
+  return legalMoves(S.board,'w',unitId).filter(move=>!S.board[move.ty][move.tx]&&!move.ep&&!move.kingSwap&&!move.fortify&&!move.abduct&&!move.cannon);
+}
+prepMovesFrom=function(unitId){
+  const piece=S.board.flat().find(candidate=>candidate?.id===unitId);if(!piece||piece.color!=='w')return[];
+  const moves=[];
+  for(let y=0;y<8;y++)for(let x=0;x<8;x++)if((x!==piece.x||y!==piece.y)&&(!S.board[y][x]||S.board[y][x].color==='w'))moves.push({fx:piece.x,fy:piece.y,tx:x,ty:y,prepSetup:true});
+  return moves;
+};
+prepRestrictedMovesFrom=function(unitId){return legalPrepMovesFrom(unitId)};
+function prepMoveSnapshot(pieces){return{pieces:pieces.filter(Boolean).map(copyPiece),ep:S.board.ep?{...S.board.ep}:null,lastMove:S.lastMove?{...S.lastMove}:null,logLength:S.log.length,preMovesRemainingBefore:S.preMovesRemaining,botPreMovesRemainingBefore:S.botPreMovesRemaining,botPrepBoardBefore:S.botPrepBoard?cloneBoard(S.botPrepBoard):null,lastMover:S.prepLastMover}}
+function syncPrepHomes(){for(const piece of S.board.flat())if(piece?.color==='w')piece.home={x:piece.x,y:piece.y};S.board.ep=null;writeBack(S.board)}
+function executePrepMove(move){
+  if(S.mode!=='prep'||S.side!=='w')return false;
+  const from=S.board[move.fy]?.[move.fx];if(!from||from.color!=='w')return false;
+  const target=S.board[move.ty]?.[move.tx],legal=legalPrepMovesFrom(from.id).find(candidate=>candidate.tx===move.tx&&candidate.ty===move.ty);
+  let record,description,paid=false;
+  if(legal){
+    let changed=[from];if(legal.castle){const rook=S.board[legal.fy][legal.castle==='k'?7:0];if(rook)changed.push(rook)}
+    record=prepMoveSnapshot(changed);description=moveLabel(legal,S.board);S.board=applyMove(S.board,legal);syncPrepHomes();
+  }else{
+    if(S.preMovesRemaining<=0){toast('합법 이동은 무료입니다. 다른 이동에는 남은 선행 수가 필요합니다.');return false;}
+    if(target&&target.color!=='w'){toast('상대 기물은 정비 중 보이지 않으며 이동 대상으로 삼을 수 없습니다.');return false;}
+    record=prepMoveSnapshot(target?[from,target]:[from]);paid=true;
+    if(target){S.board[move.fy][move.fx]=target;S.board[move.ty][move.tx]=from;target.x=move.fx;target.y=move.fy;target.home={x:move.fx,y:move.fy};target.hasMoved=true;description=`${icon(from.kind,'w')} ${coord(move.fx,move.fy)}↔${coord(move.tx,move.ty)}`}
+    else{S.board[move.fy][move.fx]=null;S.board[move.ty][move.tx]=from;from.x=move.tx;from.y=move.ty;from.home={x:move.tx,y:move.ty};from.hasMoved=true;description=`${icon(from.kind,'w')} ${coord(move.fx,move.fy)}⇢${coord(move.tx,move.ty)}`}
+    S.preMovesRemaining--;syncPrepHomes();
+  }
+  S.prepMoveUndo.push(record);S.prepLastMover='w';S.selected=null;S.legal=[];
+  S.log.push({round:S.round,turn:S.level-S.preMovesRemaining,move:description,color:'w',quality:paid?'정비 선행 수':'정비 무료 이동',bad:false,score:staticEval(S.board),regret:null});
+  playHiddenBotPrepMoves(record);S.side='w';S.statusText=`정비 선행 수 ${S.preMovesRemaining}/${S.level} · 합법 이동은 무료, 그 외 이동은 1회 차감`;render();return true;
+}
+playPrepMove=function(move){executePrepMove(move)};
+playHiddenBotPrepMoves=function(record){
+  if(!S.botPrepBoard)S.botPrepBoard=makeBoard();const visibleBoard=S.board;let label=null;S.board=S.botPrepBoard;
+  try{const moves=legalMoves(S.board,'b').filter(move=>!S.board[move.ty][move.tx]&&!move.ep&&!move.kingSwap&&!move.fortify&&!move.abduct&&!move.cannon);if(moves.length){const move=chooseBotMove(moves);label=moveLabel(move,S.board);S.board=applyMove(S.board,move);for(const piece of S.board.flat())if(piece?.color==='b')piece.home={x:piece.x,y:piece.y};S.log.push({round:S.round,turn:1,move:label,color:'b',quality:'엔진 준비 수',bad:false,score:staticEval(S.board),regret:null,prepHidden:true})}S.botPrepBoard=S.board}finally{S.board=visibleBoard}return label?1:0;
+};
+const clickBeforeMoveAllowanceRule=clickSquare;
+clickSquare=function(x,y){
+  if(S.mode!=='prep'){clickBeforeMoveAllowanceRule(x,y);return;}
+  const target=S.board[y][x],selected=typeof S.selected==='string'?S.white.find(piece=>piece.id===S.selected):null;
+  if(selected&&!selected.inField){if(target){toast('기물을 놓을 기본 시작 칸을 선택하세요.');return}if(deploySelected(x,y)){S.selected=null;S.legal=[];render()}return;}
+  if(selected?.inField){
+    const piece=S.board.flat().find(candidate=>candidate?.id===selected.id);if(!piece){S.selected=null;S.legal=[];render();return;}
+    if(piece.x===x&&piece.y===y){S.selected=null;S.legal=[];render();return;}
+    const legal=legalPrepMovesFrom(piece.id).find(move=>move.tx===x&&move.ty===y);if(legal){executePrepMove(legal);return;}
+    if(S.preMovesRemaining>0&&(!target||target.color==='w')){executePrepMove({fx:piece.x,fy:piece.y,tx:x,ty:y});return;}
+    if(target?.color==='w'){S.selected=target.id;S.legal=S.preMovesRemaining>0?prepMovesFrom(target.id):prepRestrictedMovesFrom(target.id);render();return;}
+    toast('합법 이동은 무료이며, 그 외 이동에는 선행 수가 필요합니다.');return;
+  }
+  if(target?.color==='w'){S.selected=target.id;S.legal=S.preMovesRemaining>0?prepMovesFrom(target.id):prepRestrictedMovesFrom(target.id)}else{S.selected=null;S.legal=[]}render();
+};
+const moveBeforeAllowanceRule=moveSelected;
+moveSelected=function(move){if(S.mode==='prep'){executePrepMove(move);return}moveBeforeAllowanceRule(move)};
+undoPrepMove=function(){
+  if(S.mode!=='prep'||!S.prepMoveUndo.length)return;
+  const record=S.prepMoveUndo[S.prepMoveUndo.length-1],ids=new Set(record.pieces.map(piece=>piece.id)),next=cloneBoard(S.board);
+  for(let y=0;y<8;y++)for(let x=0;x<8;x++)if(next[y][x]&&ids.has(next[y][x].id))next[y][x]=null;
+  const restorable=record.pieces.filter(saved=>S.white.some(piece=>piece.id===saved.id&&piece.alive&&piece.inField));
+  if(restorable.some(saved=>next[saved.y]?.[saved.x])){toast('되돌릴 칸이 다른 기물로 막혀 있습니다.');return;}
+  for(const saved of restorable){const piece=S.white.find(candidate=>candidate.id===saved.id);Object.assign(piece,copyPiece(saved));next[saved.y][saved.x]=piece;}
+  next.ep=record.ep?{...record.ep}:null;S.board=next;S.botPrepBoard=record.botPrepBoardBefore?cloneBoard(record.botPrepBoardBefore):S.botPrepBoard;
+  S.prepMoveUndo.pop();S.preMovesRemaining=record.preMovesRemainingBefore;S.botPreMovesRemaining=record.botPreMovesRemainingBefore;S.prepLastMover=record.lastMover;S.lastMove=record.lastMove;S.log.length=record.logLength;S.selected=null;S.legal=[];
+  S.statusText=`정비 선행 수 ${S.preMovesRemaining}/${S.level} · 이동을 되돌렸습니다.`;render();
+};
+function paintPrepCostTargets(){
+  if(S.mode!=='prep')return;const board=$('board');for(const cell of board.children)cell.classList.remove('prep-cost','legal','capture');
+  const piece=typeof S.selected==='string'?S.board.flat().find(candidate=>candidate?.id===S.selected):null;if(!piece)return;
+  const legal=new Set(legalPrepMovesFrom(piece.id).map(move=>`${move.tx},${move.ty}`));
+  for(const cell of board.children){const square=squareIndex(cell.getAttribute('aria-label')),target=S.board[square.y][square.x],key=`${square.x},${square.y}`;if(legal.has(key))cell.classList.add('legal');else if(S.preMovesRemaining>0&&(!target||target.color==='w')&&!(square.x===piece.x&&square.y===piece.y))cell.classList.add('prep-cost');}
+}
+const renderBoardBeforePrepCostTargets=renderBoard;
+renderBoard=function(){renderBoardBeforePrepCostTargets();paintPrepCostTargets()};
+document.addEventListener('pointermove',event=>{
+  if(!activeDrag?.prep||!activeDrag.prepActivated)return;
+  const board=$('board');for(const cell of board.children)cell.classList.remove('legal','capture','prep-cost');
+  const piece=S.board.flat().find(candidate=>candidate?.id===activeDrag.pieceId);if(!piece)return;
+  const legal=new Set(legalPrepMovesFrom(piece.id).map(move=>`${move.tx},${move.ty}`));
+  for(const cell of board.children){const square=squareIndex(cell.getAttribute('aria-label')),target=S.board[square.y][square.x],key=`${square.x},${square.y}`;if(legal.has(key))cell.classList.add('legal');else if(S.preMovesRemaining>0&&(!target||target.color==='w')&&!(square.x===piece.x&&square.y===piece.y))cell.classList.add('prep-cost');}
+});
+const renderBeforeAllowanceNote=render;
+render=function(){renderBeforeAllowanceNote();if(S.gameMode==='single'&&S.mode==='prep'){$('boardSub').textContent='상대의 정비 내용은 비공개입니다. 합법 이동은 무료이며, 그 외 이동은 선행 수를 사용합니다.';$('levelNote').textContent=`필드 ${fieldCap()} · 배치 ${deploymentRows()}행 · 기본 시작 칸 배치 · 비합법 이동 ${S.preMovesRemaining}/${S.level}`}};
+
+const chessComSoundBase='https://images.chesscomfiles.com/chess-themes/sounds/_MP3_/default/';
+const chessComSoundFiles={move:'move-self.mp3',opponent:'move-opponent.mp3',capture:'capture.mp3',check:'move-check.mp3',end:'game-end.mp3',start:'game-start.mp3'};
+const chessComAudioCache=new Map();
+function playChessComSound(name){if(name==='checkmate'){playChessComSound('check');window.setTimeout(()=>playChessComSound('end'),260);return}const file=chessComSoundFiles[name];if(!file)return;let audio=chessComAudioCache.get(name);if(!audio){audio=new Audio(chessComSoundBase+file);audio.preload='auto';audio.volume=.62;chessComAudioCache.set(name,audio)}try{audio.currentTime=0;const playing=audio.play();if(playing?.catch)playing.catch(()=>{})}catch{}}
+const applyLiveMoveBeforeChessComSound=applyLiveMove;
+applyLiveMove=function(move){const board=S.board,moving=board[move.fy]?.[move.fx],target=board[move.ty]?.[move.tx],captured=!!(target||move.ep),result=applyLiveMoveBeforeChessComSound(move);if(moving&&['battle','roomBattle'].includes(S.mode)){const enemy=moving.color==='w'?'b':'w';if(isCheckmate(S.board,enemy))playChessComSound('checkmate');else if(inCheck(S.board,enemy))playChessComSound('check');else if(captured)playChessComSound('capture');else playChessComSound(moving.color===S.playerColor?'move':'opponent')}return result};
+const openNextRoundBeforeChessComSound=openNextRound;
+openNextRound=function(){const before=S.mode;openNextRoundBeforeChessComSound();if(before==='prep'&&S.mode==='battle')playChessComSound('start')};
+const newGameBeforeChessComSound=newGame;
+newGame=function(difficulty='normal'){newGameBeforeChessComSound(difficulty);if(S.gameMode==='single'&&S.mode==='battle')playChessComSound('start')};
+const handleRoomMessageBeforeChessComSound=handleRoomMessage;
+handleRoomMessage=function(message){const before=S.mode;handleRoomMessageBeforeChessComSound(message);if(message?.type==='start'&&before==='roomPrep'&&S.mode==='roomBattle')playChessComSound('start')};
